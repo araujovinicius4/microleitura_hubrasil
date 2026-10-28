@@ -1,0 +1,1217 @@
+(() => {
+  const PROCESSED = 'data-microleitura-processed';
+  const CHUNK_CLASS = 'microleitura-chunk';
+  const READ_CLASS = 'microleitura-read';
+  const MARK_ATTR = 'data-microleitura-mark';
+  const PALETTE_CLASS = 'microleitura-palette';
+  const CURRENT_CLASS = 'microleitura-current';
+  const BAR_CLASS = 'microleitura-progress';
+  const STORAGE_PREFIX = 'microleitura:v4:';
+  const LEGACY_STORAGE_PREFIX = 'microleitura:v2:';
+  const MARKS = ['gray', 'green', 'yellow', 'red'];
+  const MAX_CHARS = 190;
+  let segmentationMode = 'sentence';
+  const MAX_SENTENCES = 1;
+  const EDITABLE_SELECTOR = 'input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"]';
+  const INTERACTIVE_SELECTOR = [
+    'a', 'area', 'button', 'input', 'textarea', 'select', 'option', 'summary', 'label',
+    'audio[controls]', 'video[controls]', 'iframe', 'object', 'embed',
+    '[contenteditable]:not([contenteditable="false"])',
+    '[role="button"]', '[role="link"]', '[role="checkbox"]', '[role="radio"]',
+    '[role="switch"]', '[role="tab"]', '[role="menuitem"]', '[role="option"]',
+    '[role="combobox"]', '[role="slider"]', '[role="spinbutton"]',
+    '[role="textbox"]', '[role="searchbox"]'
+  ].join(', ');
+
+  const normalize = (text) => (text || '').replace(/\s+/g, ' ').trim();
+
+  function isEditableElement(target) {
+    const element = target instanceof Element ? target : target?.parentElement;
+    return Boolean(document.designMode === 'on' || element?.isContentEditable || element?.closest(EDITABLE_SELECTOR));
+  }
+
+  function containsActiveEditor(element) {
+    const selection = window.getSelection();
+    return [document.activeElement, selection?.anchorNode, selection?.focusNode].some((node) =>
+      node && isEditableElement(node) && element.contains(node)
+    );
+  }
+
+  function isInteractiveTarget(target) {
+    const element = target instanceof Element ? target : target?.parentElement;
+    return Boolean(element?.closest(INTERACTIVE_SELECTOR));
+  }
+
+  function hasNonEmptyTextSelection() {
+    const selection = window.getSelection();
+    return Boolean(selection && !selection.isCollapsed && selection.toString().trim());
+  }
+
+  function hashString(str) {
+    let hash = 2166136261;
+    for (let i = 0; i < str.length; i++) {
+      hash ^= str.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
+  }
+
+  function isMicrosoft365Copilot() {
+    return location.hostname === 'm365.cloud.microsoft' && /^\/chat\/conversation\//.test(location.pathname);
+  }
+
+  function microsoft365CopilotConversationId() {
+    if (!isMicrosoft365Copilot()) return '';
+    const match = location.pathname.match(/^\/chat\/conversation\/([^/?#]+)/);
+    return match ? match[1] : '';
+  }
+
+  function conversationKey() {
+    // Microsoft 365 Copilot é uma SPA. A query string pode mudar durante o uso,
+    // então usamos somente o ID estável presente em /chat/conversation/<id>.
+    const copilotId = microsoft365CopilotConversationId();
+    if (copilotId) {
+      return `${STORAGE_PREFIX}${location.origin}/chat/conversation/${copilotId}`;
+    }
+    return `${STORAGE_PREFIX}${location.origin}${location.pathname}${isChatGPT() ? '' : location.search}`;
+  }
+
+  function getFrameContext() {
+    let frameId = null;
+    try { frameId = window.frameElement?.id || null; } catch (_) { /* Cross-origin parent. */ }
+    const sei = location.hostname === 'sei.ebserh.gov.br';
+    const action = new URL(location.href).searchParams.get('acao');
+    return {
+      top: window.top === window, frameId, sei,
+      seiDocument: sei && (frameId === 'ifrArvoreHtml' || action === 'documento_visualizar')
+    };
+  }
+
+  const frameContext = getFrameContext();
+  chrome.storage.local.get('microleituraDebug').then(settings => {
+    if (settings.microleituraDebug === true) console.debug('[Microleitura frame]', {
+      href: location.href, top: frameContext.top, frameId: frameContext.frameId,
+      designMode: document.designMode, chunks: document.querySelectorAll(`.${CHUNK_CLASS}`).length
+    });
+  }).catch(() => { });
+  // The SEI shell, tree and editor routes are not reading documents.
+  if (frameContext.sei && !frameContext.seiDocument) return;
+  if (document.designMode.toLowerCase() === 'on' || isEditableElement(document.body)) return;
+
+  const stateKeys = new WeakMap();
+  async function getDocumentStorageKey() {
+    if (!frameContext.sei) return conversationKey();
+    // No document-id parameter has been confirmed. Never persist session queries.
+    // Content-addressed fallback: identical documents share identity; see validation.
+    const text = getMessageRoots().map(readableIdentityText).join('\n');
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+    const hex = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+    return `${STORAGE_PREFIX}${location.origin}${location.pathname}:sei-content:${hex}`;
+  }
+
+  async function loadMarkState(key = conversationKey()) {
+    const result = await chrome.storage.local.get(key);
+    // Preserve old query-bearing ChatGPT keys without deleting their entries.
+    if (isChatGPT()) {
+      const all = await chrome.storage.local.get(null);
+      const aliases = Object.keys(all).filter((name) => name.startsWith(key + '?')).sort();
+      result[key] = Object.assign({}, ...aliases.map((name) => all[name]), result[key] || {});
+    }
+    if (result[key] && typeof result[key] === 'object' && !Array.isArray(result[key])) {
+      return new Map(Object.entries(result[key]));
+    }
+
+    // Migrate v0.2.x "read" entries to gray marks.
+    if (frameContext.sei) return new Map();
+    const legacyKey = `${LEGACY_STORAGE_PREFIX}${location.pathname}`;
+    const legacy = await chrome.storage.local.get(legacyKey);
+    const migrated = new Map((legacy[legacyKey] || []).map((id) => [id, 'gray']));
+    if (migrated.size) await saveMarkState(migrated);
+    return migrated;
+  }
+
+  async function saveMarkState(markMap) {
+    const key = stateKeys.get(markMap) || conversationKey();
+    await chrome.storage.local.set({ [key]: Object.fromEntries(markMap) });
+  }
+
+  function applyMark(span, mark) {
+    span.classList.remove(READ_CLASS);
+    span.removeAttribute(MARK_ATTR);
+    if (!mark || !MARKS.includes(mark)) return;
+    span.setAttribute(MARK_ATTR, mark);
+    if (mark === 'gray') span.classList.add(READ_CLASS);
+  }
+
+  function isChatGPT() {
+    return location.hostname === 'chatgpt.com' || location.hostname === 'chat.openai.com';
+  }
+
+  function getChatGPTRoots() {
+    // ChatGPT atual: prioriza o atributo semântico observado no DOM real.
+    // Não depende das classes geradas MarkdownRoot-* / Paragraph-*.
+    const assistantBodies = [
+      ...document.querySelectorAll('[data-markdown-text-style="assistant-message"]')
+    ].filter((el) => {
+      if (el.closest('nav, header, footer, aside, form')) return false;
+      if (isEditableElement(el) || el.querySelector(EDITABLE_SELECTOR)) return false;
+      return normalize(el.textContent).length >= 1;
+    });
+    if (assistantBodies.length) return [...new Set(assistantBodies)];
+
+    // Compatibilidade com estruturas anteriores do ChatGPT.
+    const selectorGroups = [
+      '[data-message-author-role="assistant"], [data-message-author-role="user"]',
+      '[data-testid^="conversation-turn"], [data-testid*="conversation-turn"]',
+      '[data-message-id]'
+    ];
+
+    for (const selector of selectorGroups) {
+      const roots = [...document.querySelectorAll(selector)].filter((el) => {
+        if (el.closest('nav, header, footer, aside, form')) return false;
+        if (isEditableElement(el)) return false;
+        return normalize(el.textContent).length >= 12;
+      });
+      if (roots.length) return [...new Set(roots)];
+    }
+
+    const main = document.querySelector('main, [role="main"]') || document.body;
+    const articles = [...main.querySelectorAll('article')].filter((article) => {
+      if (article.closest('nav, header, footer, aside, form')) return false;
+      if (isEditableElement(article) || article.querySelector(EDITABLE_SELECTOR)) return false;
+      const text = normalize(article.textContent);
+      return text.length >= 12 &&
+        Boolean(article.querySelector('p, li, blockquote, h1, h2, h3, h4, h5, h6') ||
+          directReadableTextLength(article) >= 12);
+    });
+    if (articles.length) return articles;
+
+    return [...main.querySelectorAll('[data-testid*="turn"], [class*="conversation-turn"]')].filter((el) => {
+      if (el.closest('nav, header, footer, aside, form')) return false;
+      if (isEditableElement(el) || el.querySelector(EDITABLE_SELECTOR)) return false;
+      return normalize(el.textContent).length >= 12;
+    });
+  }
+
+  function genericRootScore(el) {
+    const text = normalize(el.innerText);
+    const paragraphs = el.querySelectorAll('p').length;
+    const headings = el.querySelectorAll('h1,h2,h3').length;
+    const links = el.querySelectorAll('a').length;
+    return text.length + paragraphs * 180 + headings * 90 - links * 18;
+  }
+
+  function getGenericRoots() {
+    if (frameContext.seiDocument || (!frameContext.top && frameContext.frameId === 'ifrArvoreHtml')) {
+      return document.body && candidateBlocks(document.body).some(el => normalize(el.textContent).length >= 12)
+        ? [document.body] : [];
+    }
+    // Prefer semantic article containers. On listing pages, each article gets
+    // its own progress/review controls.
+    const articles = [...document.querySelectorAll('article')].filter((el) => {
+      if (el.closest('nav, header, footer, aside')) return false;
+      return normalize(el.innerText).length >= 120 && el.querySelector('p');
+    });
+    if (articles.length) return articles;
+
+    const candidates = [...document.querySelectorAll('main, [role="main"], .post, .entry-content, .post-content, .article-content, #content')].filter((el) => {
+      if (el.closest('nav, header, footer, aside')) return false;
+      return normalize(el.innerText).length >= 180 && el.querySelector('p');
+    });
+    if (candidates.length) {
+      candidates.sort((a, b) => genericRootScore(b) - genericRootScore(a));
+      return [candidates[0]];
+    }
+
+    // Last-resort fallback for simple pages.
+    const body = document.body;
+    const paragraphs = body && [...body.querySelectorAll('p')].filter(el =>
+      !isEditableElement(el) && !el.closest('nav, header, footer, aside, form, [role="navigation"], [role="tree"], [role="menu"]') &&
+      !el.querySelector('button, input, textarea') && normalize(el.textContent).length >= 40);
+    return body && paragraphs.length >= (frameContext.top ? 1 : 2) &&
+      paragraphs.reduce((sum, el) => sum + normalize(el.textContent).length, 0) >= (frameContext.top ? 300 : 180) ? [body] : [];
+  }
+
+  function getMessageRoots() {
+    return isChatGPT() ? getChatGPTRoots() : getGenericRoots();
+  }
+
+  function readableIdentityText(root) {
+    return normalize(textNodeMap(root).map((entry) => entry.node.nodeValue).join(''));
+  }
+
+  const blockTexts = new WeakMap();
+
+  function messageFingerprint(root) {
+    const text = normalize(root.innerText).slice(0, 800);
+    return hashString(text);
+  }
+
+  function eligibleBlock(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    if (isEditableElement(el)) return false;
+    if (el.hasAttribute(PROCESSED)) return false;
+    if (el.closest(`.${BAR_CLASS}, pre, button, textarea, input, nav, header, footer, aside, form, [role="navigation"], [role="tree"], [role="menu"]`)) return false;
+    if (frameContext.top && !frameContext.seiDocument && el.closest('table')) return false;
+    if (el.querySelector('pre, table, form')) return false;
+
+    const text = normalize(el.textContent);
+    return text.length >= 12;
+  }
+
+  function sentenceRanges(rawText) {
+    const ranges = [];
+    const re = /(?:[^.!?…]|[.!?…](?!\s|$))+(?:[.!?…]+(?=\s|$)|$)/g;
+    let match;
+
+    while ((match = re.exec(rawText)) !== null) {
+      let start = match.index;
+      let end = match.index + match[0].length;
+      while (start < end && /\s/.test(rawText[start])) start++;
+      while (end > start && /\s/.test(rawText[end - 1])) end--;
+      if (end > start) ranges.push({ start, end });
+    }
+
+    if (!ranges.length && normalize(rawText)) {
+      let start = 0;
+      let end = rawText.length;
+      while (start < end && /\s/.test(rawText[start])) start++;
+      while (end > start && /\s/.test(rawText[end - 1])) end--;
+      if (end > start) ranges.push({ start, end });
+    }
+
+    return ranges;
+  }
+
+  function microRanges(rawText) {
+    if (segmentationMode !== 'sentence') {
+      const ranges = [];
+      const re = segmentationMode === 'word' ? /\S+/g : /[^,]+(?:,|$)/g;
+      let match;
+      while ((match = re.exec(rawText)) !== null) {
+        let start = match.index, end = start + match[0].length;
+        while (start < end && /\s/.test(rawText[start])) start++;
+        while (end > start && /\s/.test(rawText[end - 1])) end--;
+        if (end > start) ranges.push({ start, end });
+      }
+      return ranges;
+    }
+    const sentences = sentenceRanges(rawText);
+    const chunks = [];
+    let current = null;
+    let count = 0;
+
+    for (const sentence of sentences) {
+      if (!current) {
+        current = { ...sentence };
+        count = 1;
+        continue;
+      }
+
+      const candidateLength = sentence.end - current.start;
+      if (count >= MAX_SENTENCES || candidateLength > MAX_CHARS) {
+        chunks.push(current);
+        current = { ...sentence };
+        count = 1;
+      } else {
+        current.end = sentence.end;
+        count++;
+      }
+    }
+
+    if (current) chunks.push(current);
+    return chunks;
+  }
+
+  function textNodeMap(block) {
+    const entries = [];
+    let offset = 0;
+    const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        if (isEditableElement(node)) return NodeFilter.FILTER_REJECT;
+        if (!node.nodeValue) return NodeFilter.FILTER_REJECT;
+        const parent = node.parentElement;
+        if (!parent || parent.closest(`.${BAR_CLASS}, .${PALETTE_CLASS}, script, style, noscript, nav, header, footer, aside, form, [role="navigation"], [role="tree"], [role="menu"], pre, code, button, textarea, input`)) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+
+    let node;
+    while ((node = walker.nextNode())) {
+      const start = offset;
+      offset += node.nodeValue.length;
+      entries.push({ node, start, end: offset });
+    }
+    return entries;
+  }
+
+  function uncoveredTextNodes(block) {
+    if (isEditableElement(block)) return [];
+    const nodes = [];
+    const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        if (isEditableElement(node)) return NodeFilter.FILTER_REJECT;
+        if (!normalize(node.nodeValue)) return NodeFilter.FILTER_REJECT;
+        const parent = node.parentElement;
+        if (!parent || parent.closest(`.${CHUNK_CLASS}, .${BAR_CLASS}, pre, code, button, textarea, input`)) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+
+    let node;
+    while ((node = walker.nextNode())) nodes.push(node);
+    return nodes;
+  }
+
+  function repairUncoveredText(block, root, markMap, fingerprint) {
+    if (isEditableElement(block)) return 0;
+    const nodes = uncoveredTextNodes(block);
+    for (const node of nodes) {
+      if (isEditableElement(node) || containsActiveEditor(node)) continue;
+      const rawText = node.nodeValue || '';
+      const ranges = microRanges(rawText);
+      for (let i = ranges.length - 1; i >= 0; i--) {
+        const rangeInfo = ranges[i];
+        const chunkText = normalize(rawText.slice(rangeInfo.start, rangeInfo.end)).toLowerCase();
+        const chunkId = hashString(`${location.hostname}|${fingerprint}|${chunkText}`);
+        const range = document.createRange();
+        range.setStart(node, rangeInfo.start);
+        range.setEnd(node, rangeInfo.end);
+        const span = document.createElement('span');
+        span.className = CHUNK_CLASS;
+        span.dataset.microleituraId = chunkId;
+        span.title = 'Clique para escolher uma marcação';
+        span.appendChild(range.extractContents());
+        range.insertNode(span);
+        applyMark(span, markMap.get(chunkId));
+        bindChunk(span, root, markMap);
+      }
+    }
+    return nodes.length;
+  }
+
+  function locate(entries, absoluteOffset, preferEnd = false) {
+    if (!entries.length) return null;
+    for (const entry of entries) {
+      if (absoluteOffset < entry.end || (preferEnd && absoluteOffset === entry.end)) {
+        return {
+          node: entry.node,
+          offset: Math.max(0, Math.min(entry.node.nodeValue.length, absoluteOffset - entry.start))
+        };
+      }
+    }
+    const last = entries[entries.length - 1];
+    return { node: last.node, offset: last.node.nodeValue.length };
+  }
+
+  function wrapRange(block, rangeInfo, chunkId, markMap) {
+    // A cross-node Range could extract an editor between two readable nodes.
+    if (isEditableElement(block) || block.querySelector(EDITABLE_SELECTOR) || containsActiveEditor(block)) return null;
+    const entries = textNodeMap(block);
+    const start = locate(entries, rangeInfo.start, false);
+    const end = locate(entries, rangeInfo.end, true);
+    if (!start || !end) return null;
+
+    try {
+      const range = document.createRange();
+      range.setStart(start.node, start.offset);
+      range.setEnd(end.node, end.offset);
+      if (range.collapsed) return null;
+
+      const span = document.createElement('span');
+      span.className = CHUNK_CLASS;
+      span.dataset.microleituraId = chunkId;
+      span.title = 'Clique para escolher uma marcação';
+
+      const fragment = range.extractContents();
+      span.appendChild(fragment);
+      range.insertNode(span);
+
+      applyMark(span, markMap.get(chunkId));
+      return span;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function getChunks(root) {
+    return [...root.querySelectorAll(`.${CHUNK_CLASS}`)].filter((span) => !isEditableElement(span));
+  }
+
+  function progressBarPositionKey(root) {
+    const identity = normalize(root.textContent).slice(0, 1200);
+    return `${conversationKey()}:progress:${hashString(identity)}`;
+  }
+
+  function clampProgressBarOffset(bar, root, left, top) {
+    const rect = bar.getBoundingClientRect();
+    const rootRect = root.getBoundingClientRect();
+    const isChatGPTPage = /(^|\.)chatgpt\.com$/.test(location.hostname);
+    const dragRect = isChatGPTPage
+      ? rootRect
+      : { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight };
+    const currentLeft = parseFloat(bar.style.left) || 0;
+    const currentTop = parseFloat(bar.style.top) || 0;
+    const baseLeft = rect.left - currentLeft;
+    const baseTop = rect.top - currentTop;
+    const margin = 4;
+
+    // A barra continua pertencendo visualmente ao seu próprio bloco.
+    // Isso impede barras de respostas diferentes de se acumularem na mesma área.
+    const minLeft = dragRect.left + margin - baseLeft;
+    const maxLeft = dragRect.right - margin - rect.width - baseLeft;
+    const minTop = dragRect.top + margin - baseTop;
+    const maxTop = dragRect.bottom - margin - rect.height - baseTop;
+
+    return {
+      left: Math.min(Math.max(left, Math.min(minLeft, maxLeft)), Math.max(minLeft, maxLeft)),
+      top: Math.min(Math.max(top, Math.min(minTop, maxTop)), Math.max(minTop, maxTop))
+    };
+  }
+
+  function makeProgressBarDraggable(bar, root) {
+    const handle = bar.querySelector('.microleitura-progress-label');
+    if (!handle || bar.dataset.microleituraDraggable === 'true') return;
+    bar.dataset.microleituraDraggable = 'true';
+    handle.title = 'Arraste para mover a barra Microleitura';
+
+    const positionKey = progressBarPositionKey(root);
+
+    chrome.storage.local.get(positionKey).then((result) => {
+      const saved = result[positionKey];
+
+      // No ChatGPT, cada conversa começa organizada junto aos respectivos blocos.
+      // A posição continua sendo salva durante a sessão, mas layouts antigos não
+      // são reaplicados cegamente quando a página é reconstruída.
+      if (isChatGPT()) {
+        bar.style.left = '0px';
+        bar.style.top = '0px';
+        return;
+      }
+
+      if (!saved || typeof saved.left !== 'number' || typeof saved.top !== 'number') return;
+      bar.style.left = `${saved.left}px`;
+      bar.style.top = `${saved.top}px`;
+      requestAnimationFrame(() => {
+        const bounded = clampProgressBarOffset(bar, root, saved.left, saved.top);
+        bar.style.left = `${bounded.left}px`;
+        bar.style.top = `${bounded.top}px`;
+      });
+    }).catch(() => { });
+
+    handle.addEventListener('dblclick', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      bar.style.left = '0px';
+      bar.style.top = '0px';
+      chrome.storage.local.remove(positionKey).catch(() => { });
+    });
+
+    handle.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const startLeft = parseFloat(bar.style.left) || 0;
+      const startTop = parseFloat(bar.style.top) || 0;
+      let last = { left: startLeft, top: startTop };
+
+      bar.classList.add('microleitura-dragging');
+      handle.setPointerCapture?.(event.pointerId);
+
+      const move = (moveEvent) => {
+        const proposedLeft = startLeft + moveEvent.clientX - startX;
+        const proposedTop = startTop + moveEvent.clientY - startY;
+        last = clampProgressBarOffset(bar, root, proposedLeft, proposedTop);
+        bar.style.left = `${last.left}px`;
+        bar.style.top = `${last.top}px`;
+      };
+
+      const finish = () => {
+        handle.removeEventListener('pointermove', move);
+        handle.removeEventListener('pointerup', finish);
+        handle.removeEventListener('pointercancel', finish);
+        bar.classList.remove('microleitura-dragging');
+        last = clampProgressBarOffset(bar, root, last.left, last.top);
+        bar.style.left = `${last.left}px`;
+        bar.style.top = `${last.top}px`;
+        chrome.storage.local.set({ [positionKey]: last }).catch(() => { });
+      };
+
+      handle.addEventListener('pointermove', move);
+      handle.addEventListener('pointerup', finish);
+      handle.addEventListener('pointercancel', finish);
+    });
+  }
+
+  const SUMMARY_LABELS = {
+    gray: 'Lido',
+    green: 'Entendido',
+    yellow: 'Revisar',
+    red: 'Importante/Dúvida'
+  };
+
+  function collectSummaryData(root) {
+    const groups = { gray: [], green: [], yellow: [], red: [] };
+
+    getChunks(root).forEach((chunk) => {
+      const mark = chunk.getAttribute(MARK_ATTR);
+      const text = normalize(chunk.textContent);
+      if (groups[mark] && text) groups[mark].push(text);
+    });
+
+    const markedCount = Object.values(groups).reduce((sum, items) => sum + items.length, 0);
+    return { labels: SUMMARY_LABELS, groups, markedCount };
+  }
+
+  function buildSummaryPrompt(summaryData) {
+    if (!summaryData || !summaryData.markedCount) return null;
+    const { labels, groups } = summaryData;
+
+    const sections = MARKS
+      .filter((mark) => groups[mark].length)
+      .map((mark) => `## ${labels[mark]}\n${groups[mark].map((text) => `- ${text}`).join('\n')}`)
+      .join('\n\n');
+
+    return `Gere um resumo de estudo com base nas marcações da minha Microleitura.
+
+Interprete as categorias assim:
+- Lido: contexto geral já percorrido.
+- Entendido: conceitos compreendidos e consolidados.
+- Revisar: conteúdo que preciso retomar.
+- Importante/Dúvida: pontos prioritários, importantes ou que ainda geram dúvida.
+
+Organize a resposta em:
+1. Resumo geral
+2. Verde: Principais conceitos compreendidos
+3. Amarelo: Pontos para revisar
+4. Vermelho: Pontos importantes e dúvidas
+5. Síntese final curta
+
+Use somente as informações fornecidas abaixo e não invente conteúdo.
+
+${sections}`;
+  }
+
+  async function generateSummaryResult(summaryData) {
+    const prompt = buildSummaryPrompt(summaryData);
+
+    if (!prompt) {
+      return {
+        ok: false,
+        status: 'empty',
+        text: 'Não há marcações para resumir.'
+      };
+    }
+
+    try {
+      const response = await fetch('http://127.0.0.1:3001/api/resumo', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8'
+        },
+        body: JSON.stringify({
+          texto: prompt
+        })
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        return {
+          ok: false,
+          status: response.status,
+          text: data.erro || 'Não foi possível gerar o resumo.'
+        };
+      }
+
+      return {
+        ok: true,
+        status: response.status,
+        text: data.resumo || ''
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        status: 'connection-error',
+        text: 'Não foi possível conectar ao backend da Microleitura.'
+      };
+    }
+  }
+
+  function openSummaryPanel(root) {
+    document.querySelectorAll('.microleitura-summary-panel').forEach(p => p.remove());
+    const summaryData = collectSummaryData(root);
+    const prompt = buildSummaryPrompt(summaryData);
+    const { labels, groups } = summaryData;
+    const panel = document.createElement('section');
+    panel.className = 'microleitura-summary-panel';
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-label', 'Marcações da Microleitura');
+
+    const header = document.createElement('div');
+    header.className = 'microleitura-summary-panel-header';
+    const title = document.createElement('strong'); title.textContent = 'Marcações da Microleitura';
+    const close = document.createElement('button'); close.type = 'button'; close.className = 'microleitura-summary-close';
+    close.textContent = '×'; close.title = 'Fechar'; close.addEventListener('click', () => panel.remove());
+    header.append(title, close); panel.appendChild(header);
+
+    const body = document.createElement('div'); body.className = 'microleitura-summary-panel-body';
+    let count = 0;
+    MARKS.forEach(mark => {
+      if (!groups[mark].length) return;
+      count += groups[mark].length;
+      const section = document.createElement('div'); section.className = `microleitura-summary-section microleitura-summary-${mark}`;
+      const h = document.createElement('h4'); h.textContent = `${labels[mark]} (${groups[mark].length})`; section.appendChild(h);
+      const ul = document.createElement('ul');
+      groups[mark].forEach(text => { const li = document.createElement('li'); li.textContent = text; ul.appendChild(li); });
+      section.appendChild(ul); body.appendChild(section);
+    });
+    if (!count) { const empty = document.createElement('p'); empty.textContent = 'Ainda não há marcações neste bloco.'; body.appendChild(empty); }
+    panel.appendChild(body);
+
+    const footer = document.createElement('div'); footer.className = 'microleitura-summary-panel-footer';
+    const copy = document.createElement('button'); copy.type = 'button'; copy.className = 'microleitura-summary-copy';
+    copy.textContent = 'Copiar Prompt Sem Integração com I.A'; copy.disabled = !prompt;
+    copy.addEventListener('click', async () => {
+      if (!prompt) return;
+      try { await navigator.clipboard.writeText(prompt); copy.textContent = 'Copiado!'; setTimeout(() => copy.textContent = 'Copiar Prompt Sem Integração com I.A', 1800); }
+      catch (_) { window.prompt('Copie este texto e envie ao ChatGPT:', prompt); }
+    });
+    const ai = document.createElement('button');
+    ai.type = 'button';
+    ai.className = 'microleitura-summary-ai';
+    ai.textContent = 'Gerar com IA';
+    ai.disabled = !prompt;
+    ai.title = 'Gerar resumo usando o backend da Microleitura.';
+    ai.dataset.microleituraAiReady = 'true';
+
+    const result = document.createElement('div');
+    result.className = 'microleitura-summary-result';
+    result.hidden = true;
+    result.setAttribute('aria-live', 'polite');
+
+    ai.addEventListener('click', async () => {
+      ai.disabled = true;
+      ai.textContent = 'Gerando...';
+
+      result.hidden = false;
+      result.textContent = 'Gerando resumo...';
+
+      const response = await generateSummaryResult(summaryData);
+
+      if (response.ok) {
+        result.textContent = response.text;
+      } else {
+        result.textContent = response.text || 'Não foi possível gerar o resumo.';
+      }
+
+      ai.disabled = false;
+      ai.textContent = 'Gerar com IA';
+    });
+
+    footer.append(copy, ai);
+    panel.appendChild(footer);
+    panel.appendChild(result);
+    document.body.appendChild(panel);
+  }
+
+  function openSettingsPanel() {
+    const old = document.querySelector('.microleitura-settings-panel');
+    if (old) { old.remove(); return; }
+    const panel = document.createElement('section');
+    panel.className = 'microleitura-settings-panel';
+    panel.setAttribute('aria-label', 'Configurações do Microleitura');
+    panel.innerHTML = `<div class="microleitura-settings-header"><strong>⚙ Configurações</strong><button type="button" class="ml-settings-close" aria-label="Fechar">×</button></div>
+      <label>Modo de marcação<select class="ml-settings-mode"><option value="sentence">Por ponto final (frase)</option><option value="comma">Por vírgula</option><option value="word">Por palavra</option></select></label>
+      <p>O modo escolhido vale para novas marcações. Para ver marcações anteriores, volte ao modo original.</p>
+      <div class="microleitura-settings-actions"><button type="button" class="ml-settings-export">Exportar backup JSON</button><button type="button" class="ml-settings-import">Importar backup JSON</button></div>
+      <input class="ml-settings-file" type="file" accept=".json,application/json" hidden><p class="ml-settings-status" role="status"></p>`;
+    document.body.appendChild(panel);
+    panel.querySelector('.ml-settings-close').addEventListener('click', () => panel.remove());
+    const mode = panel.querySelector('.ml-settings-mode');
+    const status = panel.querySelector('.ml-settings-status');
+    mode.value = segmentationMode;
+    mode.addEventListener('change', async () => {
+      try { await chrome.storage.local.set({ 'microleitura:segmentationMode': mode.value }); status.textContent = 'Modo salvo.'; }
+      catch (err) { status.textContent = `Falha ao salvar: ${err.message}`; }
+    });
+    const prefix = /^microleitura(?::|Debug$)/;
+    panel.querySelector('.ml-settings-export').addEventListener('click', async () => {
+      try {
+        const all = await chrome.storage.local.get(null);
+        const data = Object.fromEntries(Object.entries(all).filter(([key]) => prefix.test(key)));
+        const blob = new Blob([JSON.stringify({ format: 'microleitura-backup', version: 1, exportedAt: new Date().toISOString(), data }, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a'); link.href = url;
+        link.download = `microleitura-backup-${new Date().toISOString().slice(0,10)}.json`;
+        document.body.appendChild(link); link.click(); link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 3000);
+        status.textContent = `Backup gerado (${Object.keys(data).length} registros).`;
+      } catch (err) { status.textContent = `Falha ao exportar: ${err.message}`; }
+    });
+    const fileInput = panel.querySelector('.ml-settings-file');
+    panel.querySelector('.ml-settings-import').addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', async () => {
+      const file = fileInput.files?.[0]; if (!file) return;
+      try {
+        if (file.size > 20 * 1024 * 1024) throw new Error('Arquivo maior que 20 MB.');
+        const parsed = JSON.parse(await file.text());
+        if (parsed?.format !== 'microleitura-backup' || parsed.version !== 1 || !parsed.data || typeof parsed.data !== 'object' || Array.isArray(parsed.data)) throw new Error('Formato de backup inválido.');
+        const entries = Object.entries(parsed.data);
+        if (!entries.length || entries.some(([key]) => !prefix.test(key))) throw new Error('Backup sem registros válidos.');
+        const existing = await chrome.storage.local.get(null);
+        const conflicts = entries.filter(([key]) => Object.hasOwn(existing, key)).length;
+        if (!confirm(`Importar ${entries.length} registros? ${conflicts} registros existentes serão substituídos. Faça um backup antes de continuar.`)) return;
+        await chrome.storage.local.set(Object.fromEntries(entries));
+        status.textContent = `Importação concluída: ${entries.length} registros. Reabra a página para restaurar as marcações.`;
+      } catch (err) { status.textContent = `Falha ao importar: ${err.message}`; }
+      finally { fileInput.value = ''; }
+    });
+  }
+
+  function ensureProgressBar(root) {
+    let bar = root.querySelector(`:scope > .${BAR_CLASS}`);
+    if (bar) {
+      makeProgressBarDraggable(bar, root);
+      return bar;
+    }
+
+    bar = document.createElement('div');
+    bar.className = BAR_CLASS;
+    bar.innerHTML = `
+      <span class="microleitura-progress-label">Microleitura</span>
+      <span class="microleitura-progress-count"></span>
+      <button type="button" class="microleitura-continue">Continuar</button>
+      <button type="button" class="microleitura-theme-toggle" title="Alternar cor da barra" aria-label="Alternar cor da barra">◐</button>
+      <button type="button" class="microleitura-review">Revisar</button>
+      <button type="button" class="microleitura-summary">Gerar resumo</button>
+      <button type="button" class="microleitura-settings-button" title="Configurações" aria-label="Configurações">⚙</button>
+    `;
+
+    bar.querySelector('.microleitura-continue').addEventListener('click', (event) => {
+      event.stopPropagation();
+      const unread = getChunks(root).find((chunk) => !chunk.hasAttribute(MARK_ATTR));
+      if (unread) {
+        unread.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        unread.classList.add('microleitura-pulse');
+        setTimeout(() => unread.classList.remove('microleitura-pulse'), 900);
+      }
+    });
+
+    const themeButton = bar.querySelector('.microleitura-theme-toggle');
+    const themeKey = 'microleitura-progress-theme';
+    chrome.storage.local.get([themeKey], (saved) => {
+      if (saved?.[themeKey] === 'blue') bar.classList.add('microleitura-progress-blue');
+    });
+    themeButton.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const blue = bar.classList.toggle('microleitura-progress-blue');
+      chrome.storage.local.set({ [themeKey]: blue ? 'blue' : 'light' });
+    });
+
+    bar.querySelector('.microleitura-review').addEventListener('click', (event) => {
+      event.stopPropagation();
+      const reviewChunks = getChunks(root).filter((chunk) => {
+        const mark = chunk.getAttribute(MARK_ATTR);
+        return mark === 'yellow' || mark === 'red';
+      });
+      if (!reviewChunks.length) return;
+
+      const currentId = bar.dataset.microleituraReviewId;
+      let index = reviewChunks.findIndex((chunk) => chunk.dataset.microleituraId === currentId);
+      index = (index + 1) % reviewChunks.length;
+      const next = reviewChunks[index];
+      bar.dataset.microleituraReviewId = next.dataset.microleituraId;
+
+      next.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      next.classList.add('microleitura-review-focus');
+      setTimeout(() => next.classList.remove('microleitura-review-focus'), 1100);
+
+      const reviewButton = bar.querySelector('.microleitura-review');
+      if (reviewButton) reviewButton.textContent = `Revisar ${index + 1}/${reviewChunks.length}`;
+    });
+
+    bar.querySelector('.microleitura-settings-button').addEventListener('click', (event) => {
+      event.preventDefault(); event.stopPropagation(); openSettingsPanel();
+    });
+
+    bar.querySelector('.microleitura-summary').addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openSummaryPanel(root);
+    });
+
+    root.insertBefore(bar, root.firstChild);
+    makeProgressBarDraggable(bar, root);
+    return bar;
+  }
+
+  function updateProgress(root) {
+    if (!isChatGPT()) root = document.body;
+    const chunks = getChunks(root);
+    if (!chunks.length) return;
+
+    const read = chunks.filter((chunk) => chunk.hasAttribute(MARK_ATTR)).length;
+    const percent = Math.round((read / chunks.length) * 100);
+    const bar = ensureProgressBar(root);
+    const count = bar.querySelector('.microleitura-progress-count');
+    const button = bar.querySelector('.microleitura-continue');
+    const reviewButton = bar.querySelector('.microleitura-review');
+    const reviewChunks = chunks.filter((chunk) => {
+      const mark = chunk.getAttribute(MARK_ATTR);
+      return mark === 'yellow' || mark === 'red';
+    });
+
+    if (count) count.textContent = `${read}/${chunks.length} · ${percent}%`;
+    if (button) button.hidden = read === chunks.length;
+    if (reviewButton) {
+      reviewButton.hidden = reviewChunks.length === 0;
+      if (!reviewButton.hidden) reviewButton.textContent = `Revisar (${reviewChunks.length})`;
+      if (reviewButton.hidden) delete bar.dataset.microleituraReviewId;
+    }
+
+    chunks.forEach((chunk) => chunk.classList.remove(CURRENT_CLASS));
+    const next = chunks.find((chunk) => !chunk.hasAttribute(MARK_ATTR));
+    if (next) next.classList.add(CURRENT_CLASS);
+  }
+
+  let openPalette = null;
+
+  function closePalette() {
+    if (openPalette) openPalette.remove();
+    openPalette = null;
+  }
+
+  function showPalette(span, root, markMap) {
+    closePalette();
+    const palette = document.createElement('div');
+    palette.className = PALETTE_CLASS;
+    palette.setAttribute('role', 'menu');
+    palette.setAttribute('aria-label', 'Marcar microtrecho');
+
+    const options = [
+      ['gray', 'Lido'],
+      ['green', 'Entendido'],
+      ['yellow', 'Revisar'],
+      ['red', 'Importante/Dúvida']
+    ];
+
+    for (const [mark, label] of options) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'microleitura-color-button';
+      button.dataset.mark = mark;
+      button.title = label;
+      button.setAttribute('aria-label', label);
+      const dot = document.createElement('span');
+      dot.className = 'microleitura-color-dot';
+      dot.setAttribute('aria-hidden', 'true');
+      const text = document.createElement('span');
+      text.className = 'microleitura-color-label';
+      text.textContent = label;
+      button.append(dot, text);
+      if (span.getAttribute(MARK_ATTR) === mark) button.classList.add('is-active');
+      button.addEventListener('click', async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const id = span.dataset.microleituraId;
+        applyMark(span, mark);
+        markMap.set(id, mark);
+        updateProgress(root);
+        closePalette();
+        await saveMarkState(markMap);
+      });
+      palette.appendChild(button);
+    }
+
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'microleitura-clear-button';
+    clear.textContent = '×';
+    clear.title = 'Limpar marcação';
+    clear.setAttribute('aria-label', 'Limpar marcação');
+    clear.addEventListener('click', async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const id = span.dataset.microleituraId;
+      applyMark(span, null);
+      markMap.set(id, null);
+      updateProgress(root);
+      closePalette();
+      await saveMarkState(markMap);
+    });
+    palette.appendChild(clear);
+
+    document.body.appendChild(palette);
+    const rect = span.getBoundingClientRect();
+    const prect = palette.getBoundingClientRect();
+    let left = Math.min(window.innerWidth - prect.width - 8, Math.max(8, rect.left));
+    let top = rect.bottom + 6;
+    if (top + prect.height > window.innerHeight - 8) top = Math.max(8, rect.top - prect.height - 6);
+    palette.style.left = `${left + window.scrollX}px`;
+    palette.style.top = `${top + window.scrollY}px`;
+    openPalette = palette;
+  }
+
+  function bindChunk(span, root, markMap) {
+    if (span.dataset.microleituraBound === 'true') return;
+    span.dataset.microleituraBound = 'true';
+
+    span.addEventListener('click', (event) => {
+      if (isInteractiveTarget(event.target)) return;
+      if (hasNonEmptyTextSelection()) return;
+      event.stopPropagation();
+      showPalette(span, root, markMap);
+    });
+  }
+
+
+
+  function directReadableTextLength(el) {
+    let length = 0;
+    for (const node of el.childNodes) {
+      if (node.nodeType === Node.TEXT_NODE) length += normalize(node.nodeValue).length;
+      if (node.nodeType === Node.ELEMENT_NODE && ['SPAN', 'STRONG', 'EM', 'A', 'CODE'].includes(node.tagName)) {
+        length += normalize(node.textContent).length;
+      }
+    }
+    return length;
+  }
+
+  function candidateBlocks(root) {
+    if (isEditableElement(root)) return [];
+    const selector = isChatGPT()
+      ? 'p, li, blockquote, h1, h2, h3, h4, h5, h6'
+      : 'p, li, blockquote, h1, h2, h3, h4' + (/(^|\\.)blogspot\\./i.test(location.hostname) ? ', div' : '') + ((/(^|\\.)google\\./i.test(location.hostname) && location.pathname === '/search') ? ', div[data-sncf], div[data-content-feature], div[data-attrid], div.VwiC3b, span' : '') + (!frameContext.top || frameContext.seiDocument ? ', td, th' : '');
+    const standard = [...root.querySelectorAll(selector)].filter((el) =>
+      !el.closest('nav, header, footer, aside, form, [role="navigation"], [role="tree"], [role="menu"]') &&
+      (!el.matches('td, th') || !el.querySelector('p, li, blockquote, h1, h2, h3, h4, table'))
+    );
+
+    // Important: sometimes the element carrying data-message-author-role is itself
+    // the readable text block. querySelectorAll() only searches descendants, so
+    // the previous version silently skipped this case.
+    if (root.matches?.(selector)) standard.unshift(root);
+
+    // ChatGPT occasionally renders text directly in a div rather than a <p>.
+    // Include the root itself and descendant leaf-like divs, while avoiding UI.
+    const divPool = isChatGPT() ? [
+      ...(root.tagName === 'DIV' ? [root] : []),
+      ...root.querySelectorAll('div')
+    ] : [];
+    const fallbackDivs = divPool.filter((el) => {
+      if (el.closest(`.${BAR_CLASS}, pre, table, button, textarea, input, nav, header, footer, aside, form, [role=\"navigation\"]`)) return false;
+      if (el.querySelector('p, li, blockquote, h1, h2, h3, h4, h5, h6, pre, table, button, textarea, input')) return false;
+      if (el.querySelector(`.${CHUNK_CLASS}`) && !el.hasAttribute(PROCESSED)) return false;
+
+      const text = normalize(el.textContent);
+      if (text.length < 12) return false;
+
+      // A fallback div should mostly contain inline content, not other text containers.
+      const childDivWithText = [...el.children].some((child) =>
+        child.tagName === 'DIV' && normalize(child.textContent).length >= 12
+      );
+
+      // A container with child divs is usually UI/layout. Exception: if it also
+      // carries its own direct readable text, it is still a legitimate block.
+      return !childDivWithText || directReadableTextLength(el) >= 12;
+    });
+
+    return [...new Set([...standard, ...fallbackDivs])].filter((el) => !isEditableElement(el));
+  }
+
+  function processRoot(root, markMap) {
+    if (isEditableElement(root)) return;
+    const fingerprint = messageFingerprint(root);
+    const previous = new Map();
+    const seenBefore = new Map();
+    getChunks(root).forEach((span) => {
+      const text = normalize(span.textContent);
+      const occurrence = seenBefore.get(text) || 0;
+      seenBefore.set(text, occurrence + 1);
+      previous.set(text + '|' + occurrence, span.getAttribute(MARK_ATTR));
+    });
+    const blocks = candidateBlocks(root);
+    let blockNumber = 0;
+
+    for (const block of blocks) {
+      // Reconcile only changed reading blocks, so streaming and a clean load
+      // use the same sentence boundaries. Never unwrap or move an editor.
+      const blockText = readableIdentityText(block);
+      if (block.hasAttribute(PROCESSED) && (blockTexts.get(block) !== blockText || uncoveredTextNodes(block).length > 0) &&
+        !block.querySelector(EDITABLE_SELECTOR) && !containsActiveEditor(block)) {
+        block.querySelectorAll('.' + CHUNK_CLASS).forEach((span) => span.replaceWith(...span.childNodes));
+        block.normalize();
+        block.removeAttribute(PROCESSED);
+      }
+      if (block.hasAttribute(PROCESSED)) {
+        repairUncoveredText(block, root, markMap, fingerprint);
+        continue;
+      }
+      if (!eligibleBlock(block)) continue;
+
+      // Repair individual readable nodes without moving embedded editors.
+      if (block.querySelector(EDITABLE_SELECTOR) || containsActiveEditor(block)) {
+        block.setAttribute(PROCESSED, 'true');
+        repairUncoveredText(block, root, markMap, fingerprint);
+        continue;
+      }
+
+      const rawText = block.textContent || '';
+      const ranges = microRanges(rawText);
+      if (!ranges.length) continue;
+
+      block.setAttribute(PROCESSED, 'true');
+      const ids = ranges.map((r, index) => {
+        const chunkText = normalize(rawText.slice(r.start, r.end)).toLowerCase();
+        return hashString(`${location.hostname}|${fingerprint}|${chunkText}`);
+      });
+
+      // Process backwards so earlier character offsets remain valid.
+      for (let i = ranges.length - 1; i >= 0; i--) {
+        const span = wrapRange(block, ranges[i], ids[i], markMap);
+        if (span) bindChunk(span, root, markMap);
+      }
+      blockNumber++;
+    }
+
+    blocks.forEach((block) => blockTexts.set(block, readableIdentityText(block)));
+    // Identity contains reading text only: no innerText layout, controls or wrappers.
+    const rootText = readableIdentityText(root);
+    const roots = getMessageRoots();
+    const twin = roots.slice(0, roots.indexOf(root)).filter((other) => readableIdentityText(other) === rootText).length;
+    const scope = hashString(rootText + '|' + twin);
+    const clean = root.cloneNode(true);
+    clean.querySelectorAll('.' + BAR_CLASS + ', .' + PALETTE_CLASS).forEach((node) => node.remove());
+    // innerText on detached nodes is not layout-aware; use a text-only legacy
+    // candidate plus the original fingerprint. Unrecoverable hashes stay saved.
+    const legacyFingerprints = [fingerprint, hashString(normalize(clean.textContent).slice(0, 800))];
+    const occurrences = new Map();
+    let migrated = false;
+    getChunks(root).forEach((span) => {
+      const text = normalize(span.textContent);
+      const occurrence = occurrences.get(text) || 0;
+      occurrences.set(text, occurrence + 1);
+      const id = 't1-' + hashString(scope + '|' + text + '|' + occurrence);
+      let mark = markMap.get(id);
+      if (!mark && previous.has(text + '|' + occurrence)) mark = previous.get(text + '|' + occurrence);
+      if (!markMap.has(id) && !previous.has(text + '|' + occurrence) && !mark) {
+        for (const legacy of legacyFingerprints) {
+          mark = markMap.get(hashString(location.hostname + '|' + legacy + '|' + text.toLowerCase()));
+          if (mark) break;
+        }
+      }
+      span.dataset.microleituraId = id;
+      applyMark(span, mark);
+      if (mark && !markMap.has(id)) { markMap.set(id, mark); migrated = true; }
+      bindChunk(span, root, markMap);
+    });
+    if (migrated) void saveMarkState(markMap);
+    if (getChunks(root).length) updateProgress(root);
+  }
+
+  let markMap = null;
+  let activeKey = null;
+  let processing = false;
+  let rerunRequested = false;
+  function resetReadingContext() {
+    closePalette();
+    document.querySelectorAll(`.${BAR_CLASS}`).forEach(el => { if (!isEditableElement(el)) el.remove(); });
+    document.querySelectorAll(`.${CHUNK_CLASS}`).forEach(el => {
+      if (!isEditableElement(el) && !el.querySelector(EDITABLE_SELECTOR)) el.replaceWith(...el.childNodes);
+    });
+    document.querySelectorAll(`[${PROCESSED}]`).forEach(el => {
+      if (!isEditableElement(el)) el.removeAttribute(PROCESSED);
+    });
+  }
+  async function processPage() {
+    if (processing) { rerunRequested = true; return; }
+    processing = true;
+    observer.disconnect();
+    try {
+      if (document.designMode.toLowerCase() === 'on' || isEditableElement(document.body)) return;
+      if (!getMessageRoots().length) {
+        if (activeKey !== null) resetReadingContext();
+        activeKey = null;
+        markMap = null;
+        return;
+      }
+      const key = await getDocumentStorageKey();
+      if (key !== activeKey) {
+        if (activeKey !== null) resetReadingContext();
+        const loaded = await loadMarkState(key);
+        if (await getDocumentStorageKey() !== key) { scheduleProcess(); return; }
+        markMap = loaded;
+        stateKeys.set(markMap, key);
+        activeKey = key;
+      }
+      getMessageRoots().forEach((root) => processRoot(root, markMap));
+    } finally {
+      processing = false;
+      if (rerunRequested) {
+        rerunRequested = false;
+        scheduleProcess();
+      }
+      if (document.designMode.toLowerCase() !== 'on' && !isEditableElement(document.body)) {
+        getMessageRoots().forEach(root => observer.observe(root, { childList: true, subtree: true, characterData: true }));
+      }
+    }
+  }
+
+  let timer = null;
+  function scheduleProcess() {
+    clearTimeout(timer);
+    timer = setTimeout(processPage, 650);
+  }
+
+  document.addEventListener('click', (event) => {
+    if (openPalette && !event.target.closest(`.${PALETTE_CLASS}`) && !event.target.closest(`.${CHUNK_CLASS}`)) closePalette();
+  });
+
+  const observer = new MutationObserver((mutations) => {
+    // Typing must not schedule reading repairs; response streaming still does.
+    const external = mutations.some((mutation) => {
+      const target = mutation.target.nodeType === Node.ELEMENT_NODE
+        ? mutation.target
+        : mutation.target.parentElement;
+      return !isEditableElement(target) && !target?.closest?.(`.${BAR_CLASS}, .${PALETTE_CLASS}`) &&
+        !(mutation.type === 'childList' && [...mutation.addedNodes, ...mutation.removedNodes].length && [...mutation.addedNodes, ...mutation.removedNodes].every(node =>
+          node.nodeType === Node.ELEMENT_NODE && node.matches(`.${BAR_CLASS}, .${PALETTE_CLASS}`)));
+    });
+    if (external) scheduleProcess();
+  });
+
+  const currentRouteKey = () => isMicrosoft365Copilot() ? location.pathname : location.pathname + location.search;
+  let lastPath = currentRouteKey();
+  let lastRoots = [];
+  setInterval(() => {
+    const roots = getMessageRoots();
+    if (currentRouteKey() !== lastPath || roots.length !== lastRoots.length || roots.some((root, index) => root !== lastRoots[index])) {
+      lastPath = currentRouteKey();
+      lastRoots = roots;
+      scheduleProcess();
+    }
+  }, 800);
+
+  chrome.storage.local.get('microleitura:segmentationMode').then(result => {
+    const mode = result['microleitura:segmentationMode'];
+    if (['word', 'comma', 'sentence'].includes(mode)) segmentationMode = mode;
+    scheduleProcess();
+  }).catch(() => scheduleProcess());
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || !changes['microleitura:segmentationMode']) return;
+    const mode = changes['microleitura:segmentationMode'].newValue;
+    if (!['word', 'comma', 'sentence'].includes(mode) || mode === segmentationMode) return;
+    segmentationMode = mode;
+    resetReadingContext();
+    scheduleProcess();
+  });
+})();

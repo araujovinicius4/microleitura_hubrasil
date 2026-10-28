@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Microleitura</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <h1>Microleitura</h1>
+    <p id="message">Verificando esta página…</p>
+    <section class="settings">
+      <label for="segmentation">Modo de marcação</label>
+      <select id="segmentation">
+        <option value="sentence">Por ponto final (frase)</option>
+        <option value="comma">Por vírgula</option>
+        <option value="word">Por palavra</option>
+      </select>
+      <p class="hint">A escolha vale para novas marcações. Para ver as antigas, volte ao modo em que foram feitas.</p>
+      <button id="export-marks" type="button" class="secondary">Exportar backup JSON</button>
+      <button id="import-marks" type="button" class="secondary">Importar backup JSON</button>
+      <input id="import-file" type="file" accept=".json,application/json" hidden>
+      <p id="backup-status" role="status"></p>
+    </section>
+    <button id="open-pdf" type="button" hidden>ABRIR PDF COM MICROLEITURA</button>
+    <button id="diagnostic-button" class="secondary" type="button">Diagnóstico PDF</button>
+    <pre id="diagnostic" hidden></pre>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>
