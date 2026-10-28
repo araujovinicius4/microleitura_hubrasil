@@ -1,5 +1,0 @@
-.ml-palette{position:absolute;z-index:2147483647;background:#fff;border:1px solid #888;border-radius:10px;padding:6px;display:flex;flex-direction:column;gap:4px;min-width:230px;user-select:none}.ml-palette button{border:none;background:none;font-size:16px;cursor:pointer;text-align:left;padding:6px 10px}.ml-palette button:hover{background:#f3f4f6;border-radius:6px}
-.ml-gray{background-color:#9ca3af!important;color:#000!important;padding:2px 4px!important;border-radius:3px!important}
-.ml-green{background-color:#6B8E23!important;color:#fff!important;padding:2px 4px!important;border-radius:3px!important}
-.ml-yellow{background-color:#ffff00!important;color:#000!important;padding:2px 4px!important;border-radius:3px!important}
-.ml-red{background-color:#ff4444!important;color:#fff!important;padding:2px 4px!important;border-radius:3px!important}

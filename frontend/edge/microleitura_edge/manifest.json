@@ -1,7 +1,7 @@
 {
  "manifest_version":3,
  "name":"Microleitura V9",
- "version":"11.0.0",
+ "version":"11.5.0",
  "permissions":["storage"],
  "content_scripts":[{
   "matches":["<all_urls>"],
